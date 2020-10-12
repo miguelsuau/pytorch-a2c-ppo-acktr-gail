@@ -2,9 +2,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 
 from a2c_ppo_acktr.distributions import Bernoulli, Categorical, DiagGaussian
 from a2c_ppo_acktr.utils import init
+
 
 
 class Flatten(nn.Module):
@@ -17,6 +19,8 @@ class Policy(nn.Module):
         super(Policy, self).__init__()
         if base_kwargs is None:
             base_kwargs = {}
+        base = AttentionBase
+        # base_kwargs = {}
         if base is None:
             if len(obs_shape) == 3:
                 base = CNNBase
@@ -126,11 +130,7 @@ class NNBase(nn.Module):
 
             # Let's figure out which steps in the sequence have a zero for any agent
             # We will always assume t=0 has a zero in it as that makes the logic cleaner
-            has_zeros = ((masks[1:] == 0.0) \
-                            .any(dim=-1)
-                            .nonzero()
-                            .squeeze()
-                            .cpu())
+            has_zeros = ((masks[1:] == 0.0).any(dim=-1).nonzero().squeeze().cpu())
 
             # +1 to correct the masks[1:]
             if has_zeros.dim() == 0:
@@ -141,7 +141,6 @@ class NNBase(nn.Module):
 
             # add t=0 and t=T to the list
             has_zeros = [0] + has_zeros + [T]
-
             hxs = hxs.unsqueeze(0)
             outputs = []
             for i in range(len(has_zeros) - 1):
@@ -227,3 +226,52 @@ class MLPBase(NNBase):
         hidden_actor = self.actor(x)
 
         return self.critic_linear(hidden_critic), hidden_actor, rnn_hxs
+
+class AttentionBase(NNBase):
+    def __init__(self, num_inputs, recurrent=True, hidden_size=512, patch_size=14, embedding_size=16, image_size=84):
+        super(AttentionBase, self).__init__(recurrent, embedding_size, hidden_size)
+        self.patch_size = patch_size
+        num_patches = (image_size // patch_size) ** 2
+        patch_dim = patch_size**2
+        self.patch_embedding = nn.Linear(patch_dim, embedding_size)
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches, embedding_size))
+        self.hidden_cell_linear = nn.Linear(hidden_size, embedding_size)
+        self.tanh = nn.Tanh()
+        self.linear_attention = nn.Linear(embedding_size,1)
+        self.softmax = nn.Softmax(1)
+        init_ = lambda m: init(m, nn.init.orthogonal_, lambda x: nn.init.
+                               constant_(x, 0), np.sqrt(2))
+        self.critic_linear = init_(nn.Linear(hidden_size, 1))
+        self.train()
+
+    
+    def forward(self, inputs, rnn_hxs, masks):
+        inputs /= 255.0
+        patches = rearrange(inputs, 'b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = self.patch_size, p2 = self.patch_size)
+        embedded_patches = self.patch_embedding(patches) + self.pos_embedding
+        if inputs.size(0) == rnn_hxs.size(0):
+            query = self.hidden_cell_linear(rnn_hxs)
+            attention_logits = self.linear_attention(self.tanh(embedded_patches + query.unsqueeze(1).expand_as(embedded_patches)))
+            attention_weights = self.softmax(attention_logits)
+            x = torch.sum(attention_weights * embedded_patches, dim=1)
+            x, rnn_hxs = self.gru(x.unsqueeze(0), (rnn_hxs * masks).unsqueeze(0))
+            x = x.squeeze(0)
+            rnn_hxs = rnn_hxs.squeeze(0)
+        else:
+            N = rnn_hxs.size(0)
+            seq_len = int(inputs.size(0) / N)
+            embedded_patches = embedded_patches.view(seq_len, N, embedded_patches.size(1), embedded_patches.size(2))
+            masks = masks.view(seq_len, N, masks.size(1))
+            outputs = []
+            for step in range(seq_len):
+                query = self.hidden_cell_linear(rnn_hxs)
+                attention_logits = self.linear_attention(self.tanh(embedded_patches[step] + query.unsqueeze(1).expand_as(embedded_patches[step])))
+                attention_weights = self.softmax(attention_logits)
+                x = torch.sum(attention_weights * embedded_patches[step], dim=1)
+                x, rnn_hxs = self.gru(x.unsqueeze(0), (rnn_hxs * masks[step]).unsqueeze(0))
+                x = x.squeeze(0)
+                rnn_hxs = rnn_hxs.squeeze(0)
+                outputs.append(x)
+            x = torch.cat(outputs, dim=0)
+            x = x.view(seq_len * N, -1)
+        return self.critic_linear(x), x, rnn_hxs
